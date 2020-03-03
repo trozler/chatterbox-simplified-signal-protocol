@@ -154,11 +154,12 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
 		// TODO: your code here
+		MYDHRatchet: GenerateKeyPair();	//touched this
 	}
 
 	// TODO: your code here
 
-	return nil, errors.New("Not implemented")
+	return &c.Sessions.MyDHRatchet.publicKey, nil					//touched this
 }
 
 // ReturnHandshake prepares the first message sent in a handshake, containing
@@ -175,9 +176,13 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
 		// TODO: your code here
+		MYDHRatchet: GenerateKeyPair();								//touched this
 	}
 
 	// TODO: your code here
+	//touched that
+	c.Sessions.RootChain = CombineKeys(DHCombine(c.sessions.MyDHRatchet.publicKey, parterIdentity), DHCombine(partnerEphemeral, c.Identity.PrivateKey), DHCombine(partnerEphemeral, c.Sessions.myDHRatchet.PrivateKey)
+
 
 	return nil, nil, errors.New("Not implemented")
 }
