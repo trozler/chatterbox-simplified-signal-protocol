@@ -183,8 +183,7 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 	//touched that
 	c.Sessions.RootChain = CombineKeys(DHCombine(c.sessions.MyDHRatchet.publicKey, parterIdentity), DHCombine(partnerEphemeral, c.Identity.PrivateKey), DHCombine(partnerEphemeral, c.Sessions.myDHRatchet.PrivateKey)
 
-
-	return nil, nil, errors.New("Not implemented")
+	return &c.Sessions.RootChain, &c.Sessions.RootChain, nil     //touched that too
 }
 
 // FinalizeHandshake lets the initiator receive the responder's ephemeral key
