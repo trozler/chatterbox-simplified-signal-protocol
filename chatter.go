@@ -153,21 +153,19 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
+		MyDHRatchet:       GenerateKeyPair(), //Generating new ephemeral keys
 		// TODO: your code here
-		MyDHRatchet: GenerateKeyPair(),	//touched this
 	}
-
 	// TODO: your code here
-
-	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, nil					//touched this
+	//Sent ephemeral public key.
+	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, nil
 }
 
 // ReturnHandshake prepares the first message sent in a handshake, containing
 // an ephemeral DH share. Part of this code has been provided for you, you will
 // need to fill in the key derivation code. The partner which calls this
 // method is the responder.
-func (c *Chatter) ReturnHandshake(partnerIdentity,
-	partnerEphemeral *PublicKey) (*PublicKey, *SymmetricKey, error) {
+func (c *Chatter) ReturnHandshake(partnerIdentity, partnerEphemeral *PublicKey) (*PublicKey, *SymmetricKey, error) {
 
 	if _, exists := c.Sessions[*partnerIdentity]; exists {
 		return nil, nil, errors.New("Already have session open")
@@ -175,34 +173,29 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
+		MyDHRatchet:       GenerateKeyPair(), //Generating new ephemeral keys
+		PartnerDHRatchet:  partnerEphemeral,
 		// TODO: your code here
-		MyDHRatchet: GenerateKeyPair(),								//touched this
-
 	}
-
-	// TODO: your code here
-	//touched that
 	c.Sessions[*partnerIdentity].RootChain = CombineKeys(DHCombine(partnerIdentity, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey), DHCombine(partnerEphemeral, &c.Identity.PrivateKey), DHCombine(partnerEphemeral, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey))
-
-	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, c.Sessions[*partnerIdentity].RootChain, nil     //touched that too
+	// TODO: your code here
+	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, c.Sessions[*partnerIdentity].RootChain.DeriveKey(HANDSHAKE_CHECK_LABEL), nil
 }
 
 // FinalizeHandshake lets the initiator receive the responder's ephemeral key
 // and finalize the handshake. Part of this code has been provided, you will
 // need to fill in the key derivation code. The partner which calls this
 // method is the initiator.
-func (c *Chatter) FinalizeHandshake(partnerIdentity,
-	partnerEphemeral *PublicKey) (*SymmetricKey, error) {
+func (c *Chatter) FinalizeHandshake(partnerIdentity, partnerEphemeral *PublicKey) (*SymmetricKey, error) {
 
 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
 		return nil, errors.New("Can't finalize session, not yet open")
 	}
-
+	c.Sessions[*partnerIdentity].PartnerDHRatchet = partnerEphemeral
+	c.Sessions[*partnerIdentity].RootChain = CombineKeys(DHCombine(partnerEphemeral, &c.Identity.PrivateKey), DHCombine(partnerIdentity, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey), DHCombine(partnerEphemeral, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey))
 	// TODO: your code here
-	//Compute root for Bob
-	c.Sessions[*partnerIdentity].RootChain = CombineKeys(DHCombine(partnerEphemeral, &c.Identity.PrivateKey), DHCombine(&c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, &c.Identity.PrivateKey), DHCombine(partnerEphemeral, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey))
 
-	return c.Sessions[*partnerIdentity].RootChain, nil
+	return c.Sessions[*partnerIdentity].RootChain.DeriveKey(HANDSHAKE_CHECK_LABEL), nil
 }
 
 // SendMessage is used to send the given plaintext string as a message.
