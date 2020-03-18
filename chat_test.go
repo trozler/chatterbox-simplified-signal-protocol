@@ -25,7 +25,7 @@ import (
 )
 
 // parameters for the extended tests
-const EXTENDED_TEST_ROUNDS = 10000
+const EXTENDED_TEST_ROUNDS = 100
 const EXTENDED_TEST_PARTICIPANTS = 5
 
 // Rate of messages which will be delivered with modifications
