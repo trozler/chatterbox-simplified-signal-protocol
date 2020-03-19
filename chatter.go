@@ -37,7 +37,7 @@ package chatterbox
 
 import (
 	//	"bytes" //un-comment for helpers like bytes.equal
-	"bytes"
+
 	"encoding/binary"
 	"errors"
 	//	"fmt" //un-comment if you want to do any debug printing.
@@ -80,7 +80,7 @@ type Session struct {
 	LastUpdate        int //indicating which message number was the first sent with the newly updated sending chain
 	ReceiveCounter    int
 	LastAction        int //0 if send, 1 if recieve.
-	LastRecieve       int //0 if not compramised, 1 or more if compromised. Needed to make sure recChain is same as senders sendChain.
+	corruptedCount    int //0 if not compramised, 1 or more if compromised. Needed to make sure recChain is same as senders sendChain.
 }
 
 // Message represents a message as sent over an untrusted network.
@@ -144,7 +144,7 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 	c.Sessions[*partnerIdentity].ReceiveCounter = 0
 	c.Sessions[*partnerIdentity].LastUpdate = 0
 	c.Sessions[*partnerIdentity].LastAction = 0
-	c.Sessions[*partnerIdentity].LastRecieve = 0
+	c.Sessions[*partnerIdentity].corruptedCount = 0
 
 	for key, val := range c.Sessions[*partnerIdentity].CachedReceiveKeys {
 		val.Zeroize()
@@ -246,7 +246,7 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
 		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL) //Ratchet for next turn
 		c.Sessions[*partnerIdentity].LastAction = 0
-		c.Sessions[*partnerIdentity].LastUpdate = c.Sessions[*partnerIdentity].SendCounter
+		c.Sessions[*partnerIdentity].LastUpdate = c.Sessions[*partnerIdentity].SendCounter //First message sent on this chain.
 
 		oldRoot.Zeroize()
 
@@ -270,10 +270,20 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 // and out-of-order message handling logic happens.
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
+	//TODO - Out of order messages that are corrupted ? ? ?
+
 	if _, exists := c.Sessions[*message.Sender]; !exists {
 		return "", errors.New("Can't receive message from partner with no open session")
 	}
-	c.Sessions[*message.Sender].ReceiveCounter++
+	c.Sessions[*message.Sender].ReceiveCounter++ //Equals id of message we expect
+
+	if message.Counter > c.Sessions[*message.Sender].ReceiveCounter { //We have an early message
+
+		//
+
+	} else if message.Counter < c.Sessions[*message.Sender].ReceiveCounter { //We have a late messae
+
+	} //else{}
 
 	revertState := false
 	oldRoot := c.Sessions[*message.Sender].RootChain
@@ -285,7 +295,7 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		tempRoot := c.Sessions[*message.Sender].RootChain
 		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL) //Get first recieve chain.
 
-		for i := 1; i <= c.Sessions[*message.Sender].LastRecieve; i++ { //Need to make sure on correct send chain. As can recieve many compromised messages in a row.
+		for i := 1; i <= c.Sessions[*message.Sender].corruptedCount; i++ { //Need to make sure on correct send chain. As can recieve many compromised messages in a row.
 			tempRec := c.Sessions[*message.Sender].ReceiveChain
 			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
 			tempRec.Zeroize() //Zeroise all but first and last recieve chain. first needed as may have to reset state.
@@ -301,12 +311,12 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	}
 
 	messageKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
-	decipheredText, _ := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
-	cipherCheck := messageKey.AuthenticatedEncrypt(decipheredText, message.EncodeAdditionalData(), message.IV) //Check integrity of message - part 5 //Does cipher text recieved equal the cipher we should have recieved?
+	decipheredText, err := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
+
+	//Yes, if decryption fails you should keep the key around in case the message is correctly sent later
 	messageKey.Zeroize()
 
-	if !bytes.Equal(message.Ciphertext, cipherCheck) {
-		//We have identified a MITM attack and need to reset state.
+	if err != nil { //Means cipher text has been tamperd with
 		if prevAction == 0 {
 			c.Sessions[*message.Sender].LastAction = 0         //Recieve doesn't count, need to get ephemeral again -> root -> recChain.
 			c.Sessions[*message.Sender].RootChain.Zeroize()    //Zeroise comprimised keys.
@@ -314,7 +324,7 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 			c.Sessions[*message.Sender].RootChain = oldRoot    //Reset state
 		}
 
-		c.Sessions[*message.Sender].LastRecieve++ //Need to ratchet chain 2 * c.Sessions[*message.Sender].LastRecieve times to get recChhain on correct sendChain.
+		c.Sessions[*message.Sender].corruptedCount++ //Need to ratchet chain 2 * c.Sessions[*message.Sender].corruptedCount times to get recChhain on correct sendChain.
 		revertState = true
 	}
 
@@ -327,7 +337,7 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		oldRoot.Zeroize()
 	}
 
-	c.Sessions[*message.Sender].LastRecieve = 0
+	c.Sessions[*message.Sender].corruptedCount = 0
 
 	return decipheredText, nil
 
