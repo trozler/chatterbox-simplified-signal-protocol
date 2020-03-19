@@ -37,8 +37,10 @@ package chatterbox
 
 import (
 	//	"bytes" //un-comment for helpers like bytes.equal
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	//	"fmt" //un-comment if you want to do any debug printing.
 )
 
@@ -79,6 +81,7 @@ type Session struct {
 	LastUpdate        int //indicating which message number was the first sent with the newly updated sending chain
 	ReceiveCounter    int
 	LastAction        int //0 if send, 1 if recieve.
+	LastRecieve       int //0 if not compramised, 1 or more if compromised. Needed to make sure recChain is same as senders sendChain.
 }
 
 // Message represents a message as sent over an untrusted network.
@@ -134,7 +137,6 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
 		return errors.New("Don't have that session open to tear down")
 	}
-
 	c.Sessions[*partnerIdentity].SendChain.Zeroize()
 	c.Sessions[*partnerIdentity].ReceiveChain.Zeroize()
 	c.Sessions[*partnerIdentity].RootChain.Zeroize()
@@ -143,12 +145,12 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 	c.Sessions[*partnerIdentity].ReceiveCounter = 0
 	c.Sessions[*partnerIdentity].LastUpdate = 0
 	c.Sessions[*partnerIdentity].LastAction = 0
+	c.Sessions[*partnerIdentity].LastRecieve = 0
 
 	for key, val := range c.Sessions[*partnerIdentity].CachedReceiveKeys {
 		val.Zeroize()
 		delete(c.Sessions[*partnerIdentity].CachedReceiveKeys, key)
 	}
-
 	delete(c.Sessions, *partnerIdentity)
 
 	return nil
@@ -169,8 +171,7 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 		MyDHRatchet:       GenerateKeyPair(), //Generating new ephemeral keys
 
 	}
-	// TODO: your code here
-	//Send ephemeral public key.
+
 	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, nil
 }
 
@@ -233,6 +234,7 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 		IV:       NewIV(),
 		Counter:  c.Sessions[*partnerIdentity].SendCounter,
 	}
+
 	//We have to ratchet root key and generte new ephemeral keys.
 	if c.Sessions[*partnerIdentity].LastAction == 1 {
 		//Zeroise old keys
@@ -274,24 +276,66 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	}
 	c.Sessions[*message.Sender].ReceiveCounter++
 
+	revertState := false
+	oldRoot := c.Sessions[*message.Sender].RootChain
+	oldRecieve := c.Sessions[*message.Sender].ReceiveChain
+	prevAction := c.Sessions[*message.Sender].LastAction
+
 	if c.Sessions[*message.Sender].LastAction == 0 { //Get new Recieve Chain.
 		c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
 		c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, DHCombine(c.Sessions[*message.Sender].PartnerDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey))
-		oldRoot := c.Sessions[*message.Sender].RootChain
-		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+		tempRoot := c.Sessions[*message.Sender].RootChain
+
+		for i := 0; i <= c.Sessions[*message.Sender].LastRecieve; i++ { //Need to make sure on correct send chain. As can recieve many compromised messages in a row.
+			if i > 0 {
+				c.Sessions[*message.Sender].ReceiveChain.Zeroize() //Zeroise all but first and last recieve chain. first needed as may have to reset state.
+			}
+			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+		}
+		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL) //Let root chain be pre ratchetd for security and so we can go straight into send.
 		c.Sessions[*message.Sender].LastAction = 1
-		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL) //Let root chain be pre ratchetd to get rid of old root and so can go straight into send.
-		oldRoot.Zeroize()
+		tempRoot.Zeroize()
 
 	} else { //Keep recieving use RecievChain
-		oldRecieve := c.Sessions[*message.Sender].ReceiveChain
-		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
-		oldRecieve.Zeroize()
+		for i := 0; i <= c.Sessions[*message.Sender].LastRecieve; i++ { //Need to make sure on correct send chain. As can recieve many compromised messages in a row.
+			if i > 0 {
+				c.Sessions[*message.Sender].ReceiveChain.Zeroize() //Zeroise all but first and last recieve chain. first needed as may have to reset state.
+			}
+			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
+		}
 	}
 
 	messageKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
 	decipheredText, _ := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
+	cipherCheck := messageKey.AuthenticatedEncrypt(decipheredText, message.EncodeAdditionalData(), message.IV) //Check integrity of message - part 5 //Does cipher text recieved equal the cipher we should have recieved?
 	messageKey.Zeroize()
 
+	if !bytes.Equal(message.Ciphertext, cipherCheck) {
+		//We have identified a MITM attack and need to reset state.
+		c.Sessions[*message.Sender].RootChain.Zeroize() //Zeroise comprimised keys.
+		c.Sessions[*message.Sender].ReceiveChain.Zeroize()
+		c.Sessions[*message.Sender].RootChain = oldRoot //Reset state
+		c.Sessions[*message.Sender].ReceiveChain = oldRecieve
+
+		if prevAction == 0 {
+			c.Sessions[*message.Sender].LastAction = 0 //Recieve doesn't count, need to get ephemeral again -> root -> recChain.
+		}
+
+		c.Sessions[*message.Sender].LastRecieve++ //Need to ratchet chain 2 * c.Sessions[*message.Sender].LastRecieve times to get recChhain on correct sendChain.
+		revertState = true
+	}
+
+	if revertState == true {
+		fmt.Printf("ciphertext: %0X\n", cipherCheck) //
+		return decipheredText, errors.New("Cipher text has been modified - don't trust this message - ")
+	}
+
+	if prevAction == 0 { //Can only zero root if last action was send before this receive.
+		oldRoot.Zeroize()
+	}
+	oldRecieve.Zeroize() //Can always zero oldReceive if succesfull.
+	c.Sessions[*message.Sender].LastRecieve = 0
+
 	return decipheredText, nil
+
 }
