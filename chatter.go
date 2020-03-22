@@ -80,7 +80,7 @@ type Session struct {
 	LastUpdate        int //indicating which message number was the first sent with the newly updated sending chain
 	ReceiveCounter    int
 	LastAction        int //0 if send, 1 if recieve.
-	corruptedCount    int //0 if not compramised, 1 or more if compromised. Needed to make sure recChain is same as senders sendChain.
+	partnerLastUpdate int
 }
 
 // Message represents a message as sent over an untrusted network.
@@ -144,12 +144,12 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 	c.Sessions[*partnerIdentity].ReceiveCounter = 0
 	c.Sessions[*partnerIdentity].LastUpdate = 0
 	c.Sessions[*partnerIdentity].LastAction = 0
-	c.Sessions[*partnerIdentity].corruptedCount = 0
 
 	for key, val := range c.Sessions[*partnerIdentity].CachedReceiveKeys {
 		val.Zeroize()
 		delete(c.Sessions[*partnerIdentity].CachedReceiveKeys, key)
 	}
+
 	delete(c.Sessions, *partnerIdentity)
 
 	return nil
@@ -216,6 +216,9 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity, partnerEphemeral *PublicKey
 	c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL) //Protect by ratcheting
 	c.Sessions[*partnerIdentity].ReceiveChain = c.Sessions[*partnerIdentity].RootChain
 
+	c.Sessions[*partnerIdentity].LastUpdate = 1 //If Alice send first message need LastUpdate to be 1.
+	//If A doesnt send first message, then no harm done will be set to 1 anyways.
+
 	return handshakeReturn, nil
 }
 
@@ -233,7 +236,6 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 		IV:       NewIV(),
 		Counter:  c.Sessions[*partnerIdentity].SendCounter,
 	}
-
 	//We have to ratchet root key and generte new ephemeral keys.
 	if c.Sessions[*partnerIdentity].LastAction == 1 {
 		//Zeroise old keys
@@ -270,74 +272,141 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 // and out-of-order message handling logic happens.
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
-	//TODO - Out of order messages that are corrupted ? ? ?
-
 	if _, exists := c.Sessions[*message.Sender]; !exists {
 		return "", errors.New("Can't receive message from partner with no open session")
 	}
 	c.Sessions[*message.Sender].ReceiveCounter++ //Equals id of message we expect
+	oldLastUpdate := c.Sessions[*message.Sender].partnerLastUpdate
+	c.Sessions[*message.Sender].partnerLastUpdate = message.LastUpdate
+	var messageKey *SymmetricKey = nil
 
-	if message.Counter > c.Sessions[*message.Sender].ReceiveCounter { //We have an early message
-
-		//
-
-	} else if message.Counter < c.Sessions[*message.Sender].ReceiveCounter { //We have a late messae
-
-	} //else{}
-
-	revertState := false
 	oldRoot := c.Sessions[*message.Sender].RootChain
+	oldRec := c.Sessions[*message.Sender].ReceiveChain
 	prevAction := c.Sessions[*message.Sender].LastAction
+	potentialMkeys := make(map[int]*SymmetricKey) //Need to have a temp map for when we recieve many corrupted messages in a row and then finally recieve a valid messsage and we have just switched from sending.
 
+	if message.Counter > c.Sessions[*message.Sender].ReceiveCounter { //Receive late messages
+
+		//Case when we have out of order messages and new root sent.
+		if c.Sessions[*message.Sender].LastAction == 0 && message.LastUpdate > c.Sessions[*message.Sender].LastUpdate {
+			//Catch up on old chain
+			for i := c.Sessions[*message.Sender].LastUpdate; i < message.LastUpdate; i++ {
+				tempRec := c.Sessions[*message.Sender].ReceiveChain
+				c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
+				potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
+				potentialMkeys[i] = potentialCachedKey //Key is receive counter corrspond to message, val is message key.
+				tempRec.Zeroize()
+
+				c.Sessions[*message.Sender].ReceiveCounter++
+			}
+
+			//Catch up on messages in the interval [message.Lastupdate, message.Counter) Last message will be processed in regular flow
+			c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
+			c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, DHCombine(c.Sessions[*message.Sender].PartnerDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey))
+			tempRoot := c.Sessions[*message.Sender].RootChain
+
+			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL) //Get first recieve chain.
+			potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)                     //Get frist message key
+			potentialMkeys[c.Sessions[*message.Sender].ReceiveCounter] = potentialCachedKey
+
+			for j := message.LastUpdate + 1; j < message.Counter; j++ { //Keep getting all but last message keys on this Rec chain.
+				tempRec := c.Sessions[*message.Sender].ReceiveChain
+				c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
+				potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
+				potentialMkeys[j] = potentialCachedKey //Key is receive counter corrspond to message, val is message key.
+				tempRec.Zeroize()
+
+				c.Sessions[*message.Sender].ReceiveCounter++
+			}
+
+			c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL) //Let root chain be pre ratchetd for security and so we can go straight into send.
+			c.Sessions[*message.Sender].LastAction = 1                                                          //As no need to derive root again.
+			tempRoot.Zeroize()
+
+			//Only have to bring Recieve chain up to date.
+		} else {
+			for i := c.Sessions[*message.Sender].ReceiveCounter; i < message.Counter; i++ { //Generate all but the last key
+				tempRec := c.Sessions[*message.Sender].ReceiveChain
+				c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
+				potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
+				potentialMkeys[i] = potentialCachedKey //Key is receive counter corrspond to message, val is message key.
+				tempRec.Zeroize()
+
+				c.Sessions[*message.Sender].ReceiveCounter++
+			}
+		}
+
+	} else if message.Counter < c.Sessions[*message.Sender].ReceiveCounter { //Get messages from cache and zeroise then delete entry.
+		messageKey = c.Sessions[*message.Sender].CachedReceiveKeys[message.Counter]
+		decipheredText, err := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
+		c.Sessions[*message.Sender].ReceiveCounter-- //Accesing cached message should not increment received counter. As Rec already accounted for this.
+
+		if err != nil { //Means cipher text has been tamperd with cignore
+			//We dont have torevert any state, as nothing was updated.
+			return decipheredText, errors.New("Cipher text has been modified - break1")
+		}
+		messageKey.Zeroize()
+		delete(c.Sessions[*message.Sender].CachedReceiveKeys, message.Counter)
+		return decipheredText, nil
+	}
+
+	//TODO - For debug purposes.
+	if c.Sessions[*message.Sender].ReceiveCounter != message.Counter { //Send and recieve are synchornised.
+		println(".ReceiveCounter !=  message.Counter - This shoudl never happen")
+	}
+
+	//Beyond this point:
+	//Send and recieve are synchornised.
+	//message.Counter == c.Sessions[*message.Sender].ReceiveCounter
+
+	//Case when we have in order messages and a new ephemeral. //message.LastUpdate == c.Sessions[*message.Sender].partnerLastUpdate
+	//&& message.LastUpdate > c.Sessions[*message.Sender].LastUpdate
 	if c.Sessions[*message.Sender].LastAction == 0 { //Get new Recieve Chain.
 		c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
 		c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, DHCombine(c.Sessions[*message.Sender].PartnerDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey))
 		tempRoot := c.Sessions[*message.Sender].RootChain
 		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL) //Get first recieve chain.
-
-		for i := 1; i <= c.Sessions[*message.Sender].corruptedCount; i++ { //Need to make sure on correct send chain. As can recieve many compromised messages in a row.
-			tempRec := c.Sessions[*message.Sender].ReceiveChain
-			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
-			tempRec.Zeroize() //Zeroise all but first and last recieve chain. first needed as may have to reset state.
-		}
-		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL) //Let root chain be pre ratchetd for security and so we can go straight into send.
+		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)     //Let root chain be pre ratchetd for security and so we can go straight into send.
 		c.Sessions[*message.Sender].LastAction = 1
 		tempRoot.Zeroize()
 
-	} else { //Keep recieving use RecievChain
-		oldRecieve := c.Sessions[*message.Sender].ReceiveChain
+	} else { //Keep recieving use existing RecievChain. When message.LastUpdate <= c.Sessions[*message.Sender].LastUpdate
+		tempRecieve := c.Sessions[*message.Sender].ReceiveChain
 		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
-		oldRecieve.Zeroize()
+		tempRecieve.Zeroize()
 	}
-
-	messageKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
+	messageKey = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
 	decipheredText, err := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
 
-	//Yes, if decryption fails you should keep the key around in case the message is correctly sent later
-	messageKey.Zeroize()
+	if err != nil { //Means cipher text of last message has been tamperd with has been tamperd with
+		c.Sessions[*message.Sender].RootChain.Zeroize() //Zeroise comprimised keys.
+		c.Sessions[*message.Sender].ReceiveChain.Zeroize()
 
-	if err != nil { //Means cipher text has been tamperd with
-		if prevAction == 0 {
-			c.Sessions[*message.Sender].LastAction = 0         //Recieve doesn't count, need to get ephemeral again -> root -> recChain.
-			c.Sessions[*message.Sender].RootChain.Zeroize()    //Zeroise comprimised keys.
-			c.Sessions[*message.Sender].ReceiveChain.Zeroize() //Faulty key zeroise.
-			c.Sessions[*message.Sender].RootChain = oldRoot    //Reset state
+		c.Sessions[*message.Sender].RootChain = oldRoot   //Reset state
+		c.Sessions[*message.Sender].ReceiveChain = oldRec //Always reset Rec chain if error. Even if derive root or not
+		c.Sessions[*message.Sender].LastAction = prevAction
+		c.Sessions[*message.Sender].ReceiveCounter-- //Last key didnt happen
+		c.Sessions[*message.Sender].partnerLastUpdate = oldLastUpdate
+
+		for key, val := range potentialMkeys { //All of the cached keys didnt happen.
+			val.Zeroize()
+			delete(potentialMkeys, key)
+			c.Sessions[*message.Sender].ReceiveCounter--
 		}
 
-		c.Sessions[*message.Sender].corruptedCount++ //Need to ratchet chain 2 * c.Sessions[*message.Sender].corruptedCount times to get recChhain on correct sendChain.
-		revertState = true
+		return decipheredText, errors.New("Cipher text has been modified - break2")
 	}
 
-	if revertState == true {
-		//fmt.Printf("ciphertext: %0X\n", cipherCheck)
-		return decipheredText, errors.New("Cipher text has been modified - don't trust this message - ")
-	}
-
-	if prevAction == 0 { //Can only zero root if succesfull and last action was send before thsi recieve.
+	if prevAction == 0 { //Can only zero root if succesfull and last action was send. As if not oldRoot == current root.
 		oldRoot.Zeroize()
 	}
-
-	c.Sessions[*message.Sender].corruptedCount = 0
+	oldRec.Zeroize()
+	messageKey.Zeroize() //only zeroise key if succesful.
+	//If deryption of last message is succesful add to cache
+	for key, val := range potentialMkeys {
+		c.Sessions[*message.Sender].CachedReceiveKeys[key] = val
+		delete(potentialMkeys, key)
+	}
 
 	return decipheredText, nil
 
