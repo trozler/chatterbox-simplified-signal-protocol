@@ -26,7 +26,7 @@ import (
 
 // parameters for the extended tests
 const EXTENDED_TEST_ROUNDS = 10
-const EXTENDED_TEST_PARTICIPANTS = 5
+const EXTENDED_TEST_PARTICIPANTS = 2
 
 // Rate of messages which will be delivered with modifications
 // Set this to non-zero for test of error recovery
@@ -36,7 +36,7 @@ const EXTENDED_TEST_ERROR_RATE = 0.2
 const HANDLE_LENGTH = 4
 
 // turn on to print lots of debugging info
-const VERBOSE = true
+const VERBOSE = false
 
 func SkipOnError(t *testing.T, err error) {
 	if err != nil {

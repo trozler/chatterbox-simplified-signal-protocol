@@ -80,7 +80,7 @@ type Session struct {
 	LastUpdate        int //indicating which message number was the first sent with the newly updated sending chain
 	ReceiveCounter    int
 	LastAction        int //0 if send, 1 if recieve.
-	partnerLastUpdate int
+	Initiator         int //0 if Bob 1 if Alice
 }
 
 // Message represents a message as sent over an untrusted network.
@@ -144,6 +144,7 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 	c.Sessions[*partnerIdentity].ReceiveCounter = 0
 	c.Sessions[*partnerIdentity].LastUpdate = 0
 	c.Sessions[*partnerIdentity].LastAction = 0
+	c.Sessions[*partnerIdentity].Initiator = 0
 
 	for key, val := range c.Sessions[*partnerIdentity].CachedReceiveKeys {
 		val.Zeroize()
@@ -168,7 +169,7 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 	c.Sessions[*partnerIdentity] = &Session{
 		CachedReceiveKeys: make(map[int]*SymmetricKey),
 		MyDHRatchet:       GenerateKeyPair(), //Generating new ephemeral keys
-
+		Initiator:         1,
 	}
 
 	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, nil
@@ -257,6 +258,7 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey, plaintext string) (*Me
 		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].SendChain.DeriveKey(CHAIN_LABEL)
 		oldChain.Zeroize()
 	}
+
 	message.LastUpdate = c.Sessions[*partnerIdentity].LastUpdate
 	message.NextDHRatchet = &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey
 	messageKey := c.Sessions[*partnerIdentity].SendChain.DeriveKey(KEY_LABEL)
@@ -276,19 +278,19 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		return "", errors.New("Can't receive message from partner with no open session")
 	}
 	c.Sessions[*message.Sender].ReceiveCounter++ //Equals id of message we expect
-	oldLastUpdate := c.Sessions[*message.Sender].partnerLastUpdate
-	c.Sessions[*message.Sender].partnerLastUpdate = message.LastUpdate
+
 	var messageKey *SymmetricKey = nil
 
 	oldRoot := c.Sessions[*message.Sender].RootChain
 	oldRec := c.Sessions[*message.Sender].ReceiveChain
 	prevAction := c.Sessions[*message.Sender].LastAction
 	potentialMkeys := make(map[int]*SymmetricKey) //Need to have a temp map for when we recieve many corrupted messages in a row and then finally recieve a valid messsage and we have just switched from sending.
+	playedCatchup := 0
 
 	if message.Counter > c.Sessions[*message.Sender].ReceiveCounter { //Receive late messages
+		playedCatchup = 1
 
-		//Case when we have out of order messages and new root sent.
-		if c.Sessions[*message.Sender].LastAction == 0 && message.LastUpdate > c.Sessions[*message.Sender].LastUpdate {
+		if c.Sessions[*message.Sender].LastAction == 0 && message.LastUpdate >= c.Sessions[*message.Sender].LastUpdate && !(c.Sessions[*message.Sender].Initiator == 0 && message.LastUpdate == c.Sessions[*message.Sender].LastUpdate) {
 			//Catch up on old chain
 			for i := c.Sessions[*message.Sender].LastUpdate; i < message.LastUpdate; i++ {
 				tempRec := c.Sessions[*message.Sender].ReceiveChain
@@ -309,6 +311,8 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 			potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)                     //Get frist message key
 			potentialMkeys[c.Sessions[*message.Sender].ReceiveCounter] = potentialCachedKey
 
+			c.Sessions[*message.Sender].ReceiveCounter++
+
 			for j := message.LastUpdate + 1; j < message.Counter; j++ { //Keep getting all but last message keys on this Rec chain.
 				tempRec := c.Sessions[*message.Sender].ReceiveChain
 				c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
@@ -324,6 +328,7 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 			tempRoot.Zeroize()
 
 			//Only have to bring Recieve chain up to date.
+			//else c.Sessions[*message.Sender].LastAction == 1 || (bytes.Equal(c.Sessions[*message.Sender].PartnerDHRatchet.Fingerprint(), message.NextDHRatchet.Fingerprint()))
 		} else {
 			for i := c.Sessions[*message.Sender].ReceiveCounter; i < message.Counter; i++ { //Generate all but the last key
 				tempRec := c.Sessions[*message.Sender].ReceiveChain
@@ -334,20 +339,25 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
 				c.Sessions[*message.Sender].ReceiveCounter++
 			}
+
 		}
 
 	} else if message.Counter < c.Sessions[*message.Sender].ReceiveCounter { //Get messages from cache and zeroise then delete entry.
-		messageKey = c.Sessions[*message.Sender].CachedReceiveKeys[message.Counter]
-		decipheredText, err := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
 		c.Sessions[*message.Sender].ReceiveCounter-- //Accesing cached message should not increment received counter. As Rec already accounted for this.
 
-		if err != nil { //Means cipher text has been tamperd with cignore
-			//We dont have torevert any state, as nothing was updated.
-			return decipheredText, errors.New("Cipher text has been modified - break1")
+		if messageKey, ok := c.Sessions[*message.Sender].CachedReceiveKeys[message.Counter]; ok { //Check if key in map
+			decipheredText, err := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
+
+			if err != nil { //Means cipher text has been tamperd with cignore
+				//We dont have torevert any state, as nothing was updated.
+				return "", errors.New("Cipher text has been modified - break1")
+			}
+			messageKey.Zeroize()
+			delete(c.Sessions[*message.Sender].CachedReceiveKeys, message.Counter)
+			return decipheredText, nil
 		}
-		messageKey.Zeroize()
-		delete(c.Sessions[*message.Sender].CachedReceiveKeys, message.Counter)
-		return decipheredText, nil
+
+		return "", errors.New("Replay of previously deciphered message")
 	}
 
 	//TODO - For debug purposes.
@@ -359,9 +369,9 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	//Send and recieve are synchornised.
 	//message.Counter == c.Sessions[*message.Sender].ReceiveCounter
 
-	//Case when we have in order messages and a new ephemeral. //message.LastUpdate == c.Sessions[*message.Sender].partnerLastUpdate
+	//Case when we have in order messages and a new ephemeral.
 	//&& message.LastUpdate > c.Sessions[*message.Sender].LastUpdate
-	if c.Sessions[*message.Sender].LastAction == 0 { //Get new Recieve Chain.
+	if playedCatchup == 0 && c.Sessions[*message.Sender].LastAction == 0 { //Get new Recieve Chain.
 		c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
 		c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, DHCombine(c.Sessions[*message.Sender].PartnerDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey))
 		tempRoot := c.Sessions[*message.Sender].RootChain
@@ -386,7 +396,6 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		c.Sessions[*message.Sender].ReceiveChain = oldRec //Always reset Rec chain if error. Even if derive root or not
 		c.Sessions[*message.Sender].LastAction = prevAction
 		c.Sessions[*message.Sender].ReceiveCounter-- //Last key didnt happen
-		c.Sessions[*message.Sender].partnerLastUpdate = oldLastUpdate
 
 		for key, val := range potentialMkeys { //All of the cached keys didnt happen.
 			val.Zeroize()
@@ -394,12 +403,13 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 			c.Sessions[*message.Sender].ReceiveCounter--
 		}
 
-		return decipheredText, errors.New("Cipher text has been modified - break2")
+		return "", errors.New("Cipher text has been modified - break2")
 	}
 
-	if prevAction == 0 { //Can only zero root if succesfull and last action was send. As if not oldRoot == current root.
+	if prevAction == 0 && playedCatchup == 0 { //Can only zero root if succesfull and last action was send. As if not oldRoot == current root. And if we didnt just play catch up.
 		oldRoot.Zeroize()
 	}
+
 	oldRec.Zeroize()
 	messageKey.Zeroize() //only zeroise key if succesful.
 	//If deryption of last message is succesful add to cache
@@ -409,5 +419,4 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	}
 
 	return decipheredText, nil
-
 }
