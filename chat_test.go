@@ -25,12 +25,12 @@ import (
 )
 
 // parameters for the extended tests
-const EXTENDED_TEST_ROUNDS = 10
-const EXTENDED_TEST_PARTICIPANTS = 2
+const EXTENDED_TEST_ROUNDS = 1000
+const EXTENDED_TEST_PARTICIPANTS = 5
 
 // Rate of messages which will be delivered with modifications
 // Set this to non-zero for test of error recovery
-const EXTENDED_TEST_ERROR_RATE = 0.2
+const EXTENDED_TEST_ERROR_RATE = 0 //Set to 0.2 for error recovery.
 
 // number of bytes of fingerprint to display in output
 const HANDLE_LENGTH = 4
