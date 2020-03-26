@@ -33,6 +33,8 @@
 // Original version
 // Joseph Bonneau February 2019
 
+//Written by Tony Rosler (tcr278) and Bryan Jia Gu (bjg416).
+
 package chatterbox
 
 import (
@@ -278,13 +280,16 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		return "", errors.New("Can't receive message from partner with no open session")
 	}
 
+	oldRecVal := c.Sessions[*message.Sender].ReceiveCounter
 	c.Sessions[*message.Sender].ReceiveCounter++ //Equals id of message we expect
 	var messageKey *SymmetricKey = nil
 
-	oldRoot := c.Sessions[*message.Sender].RootChain
-	oldRec := c.Sessions[*message.Sender].ReceiveChain
+	oldRoot := c.Sessions[*message.Sender].RootChain.Duplicate()
+	oldRec := c.Sessions[*message.Sender].ReceiveChain.Duplicate()
 	prevAction := c.Sessions[*message.Sender].LastAction
 	potentialMkeys := make(map[int]*SymmetricKey) //Need to have a temp map for when we recieve many corrupted messages in a row and then finally recieve a valid messsage and we have just switched from sending.
+	touchedRoot := 0
+	oldPartnerDHRatchet := c.Sessions[*message.Sender].PartnerDHRatchet
 
 	if message.Counter < c.Sessions[*message.Sender].ReceiveCounter { //Get messages from cache and zeroise then delete entry.
 		c.Sessions[*message.Sender].ReceiveCounter-- //Accesing cached message should not increment received counter. As Rec already accounted for this.
@@ -303,7 +308,7 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
 	} else if !bytes.Equal(c.Sessions[*message.Sender].PartnerDHRatchet.Fingerprint(), message.NextDHRatchet.Fingerprint()) {
 
-		//if c.Sessions[*message.Sender].ReceiveCounter < message.LastUpdate //Update on old chain before generte enew root.
+		touchedRoot = 1
 		for i := c.Sessions[*message.Sender].ReceiveCounter; i < message.LastUpdate; i++ { //Catch up on old chain if necessary. How do we know still messags on old receive chian.
 			potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
 			potentialMkeys[i] = potentialCachedKey //Key is receive counter corrspond to message, val is message key.
@@ -319,9 +324,9 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		tempRoot := c.Sessions[*message.Sender].RootChain
 		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL) //Get first recieve chain.
 
-		for i := c.Sessions[*message.Sender].ReceiveCounter; i <= message.Counter; i++ { //Catch up on old chain if necessary. How do we know still messags on old receive chian.
+		for i := c.Sessions[*message.Sender].ReceiveCounter; i <= message.Counter; i++ { //Catch up on old chain if necessary.
 			potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
-			potentialMkeys[i] = potentialCachedKey //Key is receive counter corrspond to message, val is message key.
+			potentialMkeys[i] = potentialCachedKey
 			tempRec := c.Sessions[*message.Sender].ReceiveChain
 			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
 			tempRec.Zeroize()
@@ -331,16 +336,13 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		c.Sessions[*message.Sender].ReceiveCounter--
 
 		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL) //Let root chain be pre ratchetd for security and so we can go straight into send.
-		c.Sessions[*message.Sender].LastAction = 1                                                          //As no need to derive root again.
+		c.Sessions[*message.Sender].LastAction = 1
 		tempRoot.Zeroize()
 
-		oldRoot.Zeroize()
-
-		//Only have to bring Recieve chain up to date.
-	} else {
-		for i := c.Sessions[*message.Sender].ReceiveCounter; i <= message.Counter; i++ { //Generate all keys
+	} else { //Only have to bring Recieve chain up to date.
+		for i := c.Sessions[*message.Sender].ReceiveCounter; i <= message.Counter; i++ {
 			potentialCachedKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
-			potentialMkeys[i] = potentialCachedKey //Key is receive counter corrspond to message, val is message key.
+			potentialMkeys[i] = potentialCachedKey
 			tempRec := c.Sessions[*message.Sender].ReceiveChain
 			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
 			tempRec.Zeroize()
@@ -351,30 +353,33 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	}
 
 	messageKey = potentialMkeys[c.Sessions[*message.Sender].ReceiveCounter] //Gets last key we generated.
-	delete(potentialMkeys, c.Sessions[*message.Sender].ReceiveCounter)
 	decipheredText, err := messageKey.AuthenticatedDecrypt((*message).Ciphertext, message.EncodeAdditionalData(), (*message).IV)
 
 	if err != nil { //Means cipher text of last message has been tamperd with has been tamperd with
+
 		c.Sessions[*message.Sender].RootChain.Zeroize() //Zeroise comprimised keys.
 		c.Sessions[*message.Sender].ReceiveChain.Zeroize()
 
 		c.Sessions[*message.Sender].RootChain = oldRoot   //Reset state
 		c.Sessions[*message.Sender].ReceiveChain = oldRec //Always reset Rec chain if error. Even if derive root or not
 		c.Sessions[*message.Sender].LastAction = prevAction
-		c.Sessions[*message.Sender].ReceiveCounter-- //Last key didnt happen
+		c.Sessions[*message.Sender].ReceiveCounter = oldRecVal
+		c.Sessions[*message.Sender].PartnerDHRatchet = oldPartnerDHRatchet
 
-		for key, val := range potentialMkeys { //All of the cached keys didnt happen.
+		for key, val := range potentialMkeys { //zero messageKey as it points to the same key as in the map. And all cached keys didn't happen.
 			val.Zeroize()
 			delete(potentialMkeys, key)
-			c.Sessions[*message.Sender].ReceiveCounter--
 		}
 		return "", errors.New("Cipher text has been modified - break2")
 	}
+	messageKey.Zeroize()                                               //Zero message key here, messageKey is also zerod in the for loop within the above if statemnt.
+	delete(potentialMkeys, c.Sessions[*message.Sender].ReceiveCounter) //Now we can delete key we just used, may be zerod if error occurs
 
+	if touchedRoot == 1 {
+		oldRoot.Zeroize()
+	}
 	oldRec.Zeroize()
-	messageKey.Zeroize() //only zeroise key if succesful.
-	//If deryption of last message is succesful add to cache
-	for key, val := range potentialMkeys {
+	for key, val := range potentialMkeys { //If deryption of last message is succesful add all keys to cache
 		c.Sessions[*message.Sender].CachedReceiveKeys[key] = val
 		delete(potentialMkeys, key)
 	}
